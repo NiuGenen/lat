@@ -768,7 +768,7 @@ static inline uint32_t curr_cflags(CPUState *cpu)
 #if defined(CONFIG_USER_ONLY)
 void tb_invalidate_phys_addr(target_ulong addr);
 void tb_invalidate_phys_range(target_ulong start, target_ulong end);
-bool tb_invalidate_phys_page_unwind(tb_page_addr_t addr, uintptr_t pc);
+bool tb_invalidate_phys_page_unwind(tb_page_addr_t addr, uintptr_t pc, int *n);
 #else
 void tb_invalidate_phys_addr(AddressSpace *as, hwaddr addr, MemTxAttrs attrs);
 #endif

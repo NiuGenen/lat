@@ -75,6 +75,9 @@ extern int option_mem_test;
 extern int option_real_maps;
 extern int option_monitor_shared_mem;
 extern int option_shadow_file;
+extern int option_smc_opt;
+static inline int latx_smc_inv_page(void) { return option_smc_opt == 0; }
+static inline int latx_smc_inv_tb(void) { return option_smc_opt != 0; }
 
 extern unsigned long long counter_tb_exec;
 extern unsigned long long counter_tb_tr;

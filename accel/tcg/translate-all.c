@@ -2512,14 +2512,36 @@ void tb_invalidate_phys_page(tb_page_addr_t addr)
     tb_invalidate_phys_range(start, end);
 }
 
+static inline bool tb_is_covered(TranslationBlock *tb, uint64_t addr, int size)
+{
+    /*
+     *  addr           |     addr      |         addr    |  addr
+     *  | size         |     | size    |         | size  |  | size
+     *  +++++          |     +++++     |         +++++   |  +++++++++++++
+     *     +++++++++   |   +++++++++   |   +++++++++     |    +++++++++
+     *     | tb->size  |   | tb->size  |   | tb->size    |    | tb->size
+     *    tb->pc       |  tb->pc       |  tb->pc         |   tb->pc
+     */
+    return (addr + size - 1) >= (tb->pc) && (tb->pc + tb->size - 1) >= addr;
+}
+
 /*
  * Called with mmap_lock held. If pc is not 0 then it indicates the
  * host PC of the faulting store instruction that caused this invalidate.
  * Returns true if the caller needs to abort execution of the current
  * TB (because it was modified by this store and the guest CPU has
  * precise-SMC semantics).
+ *
+ * When @tbcount != NULL means we should invalidate only the specific TB
+ * that might be modified by the store inst.
+ * The @addr is the memory address of the store.
+ * The *tbcount is the size of the store inst.
+ * The @pc points to the store inst in code cache. (+ GETPC_ADJ)
+ *
+ * When return, the *tbcount indicates that wether there are TB in the page,
+ * which means the page is writable or not.
  */
-bool tb_invalidate_phys_page_unwind(tb_page_addr_t addr, uintptr_t pc)
+bool tb_invalidate_phys_page_unwind(tb_page_addr_t addr, uintptr_t pc, int *tbcount)
 {
     assert(pc != 0);
 #ifdef TARGET_HAS_PRECISE_SMC
@@ -2529,9 +2551,19 @@ bool tb_invalidate_phys_page_unwind(tb_page_addr_t addr, uintptr_t pc)
         bool current_tb_modified = false;
         TranslationBlock *tb;
         PageForEachNext n;
+        uint64_t smcaddr = 0;
+        int smcsize = 0;
+        bool smc_crosspage = false;
 
         uint32_t inst = 0;
 
+        if (tbcount) {
+            smcaddr = addr;
+            smcsize = *tbcount;
+            *tbcount = 0;
+            smc_crosspage = ((addr) & TARGET_PAGE_MASK) !=
+                            ((addr + smcsize - 1) & TARGET_PAGE_MASK);
+        }
         addr &= TARGET_PAGE_MASK;
 
 #ifdef CONFIG_LATX_AOT
@@ -2542,7 +2574,19 @@ bool tb_invalidate_phys_page_unwind(tb_page_addr_t addr, uintptr_t pc)
         }
 #endif
 
+        /* start from the 2nd page when cross page */
+        if (smc_crosspage) {
+            addr += TARGET_PAGE_SIZE;
+        }
+
+foreach_tb_start:
+
         PAGE_FOR_EACH_TB(addr, addr + TARGET_PAGE_SIZE, unused, tb, n) {
+            if (tbcount && !tb_is_covered(tb, smcaddr, smcsize)) {
+                // this TB is not affected, mark it and continue
+                *tbcount |= 0x1;
+                continue;
+            }
             if (current_tb == tb &&
                 (tb_cflags(current_tb) & CF_COUNT_MASK) != 1) {
                 /*
@@ -2564,6 +2608,19 @@ bool tb_invalidate_phys_page_unwind(tb_page_addr_t addr, uintptr_t pc)
                 flush_idcache_range((uintptr_t)tb->tc.ptr, (uintptr_t)tb->tc.ptr, 4);
             }
         }
+
+        /* back to handle the 1st page when cross page */
+        if (smc_crosspage) {
+            addr -= TARGET_PAGE_SIZE;
+            smc_crosspage = false;
+            *tbcount = *tbcount << 1;
+            goto foreach_tb_start;
+        }
+
+        /*
+         * At here, the *tbcount indicate that if there are TB in the page.
+         * The bit[0] for 1st page and bit[1] for 2nd page when cross.
+         */
 
         if (current_tb_modified) {
             /* Force execution of one insn next time.  */
@@ -3788,7 +3845,7 @@ bool page_check_range(target_ulong start, target_ulong len, int flags)
                 break;
             }
             /* Asking about writable, but has been protected: undo. */
-            if (!page_unprotect(start, 0)) {
+            if (!page_unprotect(start, 0, NULL)) {
                 ret = false;
                 break;
             }
@@ -3891,21 +3948,64 @@ void page_protect(tb_page_addr_t address)
     }
 }
 
+#define SMC_CREATE_SHADOW_PAGE(address, p) do {                             \
+    if (!is_shadow_page(address) && !(p->flags & PAGE_WRITE)) {             \
+        target_ulong start, end;                                            \
+        start = address & qemu_host_page_mask;                              \
+        end = start + qemu_host_page_size;                                  \
+        create_shadow_page_chunk(start, end,                                \
+                PAGE_READ | PAGE_WRITE,                                     \
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);                        \
+    }                                                                       \
+} while (0)
+
+#define SMC_ENABLE_PAGE_WRITE(addr, p) do {                                 \
+    if (p && (p->flags & PAGE_WRITE_ORG) && !(p->flags & PAGE_WRITE)) {     \
+        uint64_t _addr = addr & TARGET_PAGE_MASK;                           \
+        pageflags_set_clear(_addr, _addr + TARGET_PAGE_SIZE - 1,            \
+                            PAGE_WRITE, 0);                                 \
+    }                                                                       \
+} while (0)
+
 /* called from signal handler: invalidate the code and unprotect the
  * page. Return 0 if the fault was not handled, 1 if it was handled,
  * and 2 if it was handled but the caller must cause the TB to be
  * immediately exited. (We can only return 2 if the 'pc' argument is
  * non-zero.)
+ *
+ * @emu != NULL means we should invalidate only the specific TB
+ * that might be modified by the store inst.
+ * The *emu contains the size of the store inst.
+ *
+ * When return, the *emu indicates that wether the store inst needs
+ * to be interpreted because the page is still not writable.
  */
-int page_unprotect(target_ulong address, uintptr_t pc)
+int page_unprotect(target_ulong address, uintptr_t pc, int *emu)
 {
-    PageFlagsNode *p;
+    PageFlagsNode *p = NULL, *p2 = NULL;
     bool current_tb_invalidated;
+    int do_mprotect = 1;
+    int inv_one_tb = 0;
+    int size = 1;
 
     /* Technically this isn't safe inside a signal handler.  However we
        know this only ever happens in a synchronous SEGV handler, so in
        practice it seems to be ok.  */
     mmap_lock();
+
+    if (emu) {
+        inv_one_tb = 1;
+        size = *emu;
+        *emu = 0;
+    }
+
+    target_ulong address2 = address + size - 1;
+    int is_cross = (address  & TARGET_PAGE_MASK) !=
+                   (address2 & TARGET_PAGE_MASK);
+    int is_cross_host = (address  & qemu_host_page_mask) !=
+                        (address2 & qemu_host_page_mask);
+    /* If @emu == NULL, the size will be 1 which makes address == address2.
+     * Then is_cross and is_cross_host will both be false. */
 
     p = pageflags_find(address, address);
 
@@ -3914,9 +4014,17 @@ int page_unprotect(target_ulong address, uintptr_t pc)
         mmap_unlock();
         return 0;
     }
+    if (is_cross) {
+        p2 = pageflags_find(address2, address2);
+        if (!p2 || !(p2->flags & PAGE_WRITE_ORG)) {
+            mmap_unlock();
+            return 0;
+        }
+    }
 
     current_tb_invalidated = false;
-    if (p->flags & PAGE_WRITE) {
+    if ((!is_cross && p->flags & PAGE_WRITE) ||
+        ( is_cross && p->flags & PAGE_WRITE && p2->flags & PAGE_WRITE)) {
         /*
          * If the page is actually marked WRITE then assume this is because
          * this thread raced with another one which got here first and
@@ -3941,12 +4049,97 @@ int page_unprotect(target_ulong address, uintptr_t pc)
         target_ulong start, len, i;
         int prot;
 
-        if (qemu_host_page_size <= TARGET_PAGE_SIZE) {
+        if (inv_one_tb) {
+            /* === create shadow page for smc === */
+            SMC_CREATE_SHADOW_PAGE(address, p);
+            if (is_cross_host) {
+                SMC_CREATE_SHADOW_PAGE(address2, p2);
+            }
+            /* The smc page must be shadow page here, no need mprotect */
+            do_mprotect = 0;
+
+            /* === do tb invalidate === */
+            int tbcount = size;
+            /* when call : tbcount contains the size of the store inst. */
+            current_tb_invalidated =
+                tb_invalidate_phys_page_unwind(address, pc, &tbcount);
+            /* when return:
+             * if not cross page :
+             *     tbcount = 1 : page contains other tb : not allow write
+             *     tbcount = 0 : page contains no tb    : ok to write
+             * if cross page :
+             *     tbcount bit[0] for page of address
+             *     tbcount bit[1] for page of the next
+             */
+
+            /* === wether guest page is writable === */
+            if (tbcount) {
+                /*
+                 * write is still not allowed on this page,
+                 * or at least one of the two pages when cross.
+                 * The original store inst needs to be interpreted.
+                 *
+                 * If cross, the value could be 0b01 or 0b10, which
+                 * means one of the two pages becomes writable.
+                 * But for simplify, just interpret here.
+                 */
+                *emu = 1;
+            } else {
+                /*
+                 * Enable write on this page.
+                 *
+                 * When cross, here the 2nd page is also writable.
+                 * Enable write on the 2nd page too.
+                 */
+                if (qemu_host_page_size <= TARGET_PAGE_SIZE) {
+                    SMC_ENABLE_PAGE_WRITE(address, p);
+                    if (is_cross) {
+                        SMC_ENABLE_PAGE_WRITE(address2, p2);
+                    }
+                    /* no need interpret since the pages are writable */
+                    *emu = 0;
+                } else {
+                    start = address & qemu_host_page_mask;
+                    len = qemu_host_page_size;
+                    prot = PAGE_BITS;
+                    /* for all guest pages in this host pages */
+                    for (i = 0; i < len; i += TARGET_PAGE_SIZE) {
+                        target_ulong addr = start + i;
+                        p = pageflags_find(addr, addr);
+                        if (!p) continue;
+                        /* enable write on the related guest page */
+                        if (addr == (address & TARGET_PAGE_MASK))
+                            SMC_ENABLE_PAGE_WRITE(address, p);
+                        if (is_cross && addr == (address2 & TARGET_PAGE_MASK))
+                            SMC_ENABLE_PAGE_WRITE(address2, p);
+                        /* accumulate to get the final prot of the host page */
+                        prot &= p->flags;
+                    }
+                    /* enable write on the 2nd guest page if cross host */
+                    if (is_cross_host) {
+                        SMC_ENABLE_PAGE_WRITE(address2, p2);
+                    }
+                    /*
+                     * The original store inst needs to be interpreted if the
+                     * host page is not writable when not cross host page.
+                     *
+                     * If cross host, since the 2nd host page's prot is not
+                     * parsed here, so we do not know if it is writable.
+                     * Just interpret the store inst for simplify.
+                     */
+                    if ((prot & PAGE_WRITE) && !is_cross_host) {
+                        *emu = 0;
+                    } else {
+                        *emu = 1;
+                    }
+                }
+            }
+        } else if (qemu_host_page_size <= TARGET_PAGE_SIZE) {
             start = address & TARGET_PAGE_MASK;
             len = TARGET_PAGE_SIZE;
             prot = p->flags | PAGE_WRITE;
             pageflags_set_clear(start, start + len - 1, PAGE_WRITE, 0);
-            current_tb_invalidated = tb_invalidate_phys_page_unwind(start, pc);
+            current_tb_invalidated = tb_invalidate_phys_page_unwind(start, pc, NULL);
         } else {
             start = address & qemu_host_page_mask;
             len = qemu_host_page_size;
@@ -3969,14 +4162,16 @@ int page_unprotect(target_ulong address, uintptr_t pc)
                 * the corresponding translated code.
                 */
                 current_tb_invalidated |=
-                    tb_invalidate_phys_page_unwind(addr, pc);
+                    tb_invalidate_phys_page_unwind(addr, pc, NULL);
             }
         }
-        if (prot & PAGE_EXEC) {
-            prot = (prot & ~PAGE_EXEC) | PAGE_READ;
-        }
-        if (!is_shadow_page(address)) {
-            mprotect((void *)g2h_untagged(start), len, prot & PAGE_BITS);
+        if (do_mprotect) {
+            if (prot & PAGE_EXEC) {
+                prot = (prot & ~PAGE_EXEC) | PAGE_READ;
+            }
+            if (!is_shadow_page(address)) {
+                mprotect((void *)g2h_untagged(start), len, prot & PAGE_BITS);
+            }
         }
     }
     mmap_unlock();
