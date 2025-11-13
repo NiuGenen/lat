@@ -32,6 +32,7 @@
 
 #ifdef CONFIG_LATX
 #include "qemu.h"
+#include "latx-options.h"
 #include "latx-backtrace.h"
 #endif
 #ifdef CONFIG_LATX_DEBUG
@@ -194,6 +195,116 @@ static void show_latx_signal_debuginfo(siginfo_t *info, uintptr_t pc,
 }
 #endif
 
+#ifdef CONFIG_LATX_SMC_OPT
+
+static uint64_t parse_guest_store(siginfo_t *info, ucontext_t *uc, int *size)
+{
+    uint32_t inst = *(uint32_t *)UC_PC(uc);
+    int rj = (inst >> 5) & 0x1f;
+    int16_t imm12 = (inst >> 10) & 0xfff;
+    imm12 = (int16_t)(imm12 << 4) >> 4;
+    int64_t real_guest_addr = UC_GR(uc)[rj] + imm12;
+
+    switch (inst >> 22) {
+    case 0xa4: /* ST.B */ *size = 1; break;
+    case 0xa5: /* ST.H */ *size = 2; break;
+    case 0xa6: /* ST.W */ *size = 4; break;
+    case 0xa7: /* ST.D */ *size = 8; break;
+    case 0xb1: /* VST */ *size = 16; break;
+    default:
+        fprintf(stderr, "%s:%d SMC unsupport inst %08x\n",
+                __func__, __LINE__, inst);
+        fflush(stderr);
+        g_assert_not_reached();
+        break;
+    }
+
+    return real_guest_addr;
+}
+
+static void write_by_byte(int64_t addr, int64_t value, int byte_count)
+{
+    for (int i = 0; i < byte_count; i++) {
+        *(char *)addr = (char)(value >> (i * 8) & 0xff);
+        addr += 1;
+    }
+}
+
+static void smc_store_shadow_page(int64_t mem_addr, int64_t value, int deal_byte_count)
+{
+    int64_t page2_addr = (mem_addr & TARGET_PAGE_MASK) + TARGET_PAGE_SIZE;
+    int page1_byte_count = page2_addr - mem_addr;
+    if (deal_byte_count < page1_byte_count) {
+        page1_byte_count = deal_byte_count;
+    }
+    ShadowPageDesc *spd = page_get_target_data(mem_addr);
+    if (spd) {
+        mem_addr += spd->access_off;
+    }
+    /* Write page1. */
+    write_by_byte(mem_addr, value, page1_byte_count);
+    /* Write page2. */
+    if (page1_byte_count < deal_byte_count) {
+        deal_byte_count -= page1_byte_count;
+        value >>= (page1_byte_count << 3);
+        spd = page_get_target_data(page2_addr);
+        if (spd) {
+            page2_addr += spd->access_off;
+        }
+        write_by_byte(page2_addr, value, deal_byte_count);
+    }
+}
+
+static int smc_store_interpret(siginfo_t *info, ucontext_t *uc)
+{
+    uint32_t inst, rd, rj, fd;
+    int64_t value, mem_addr;
+
+    inst = *(uint32_t *)UC_PC(uc);
+    rd = inst & 0x1f;
+    rj = (inst >> 5) & 0x1f;
+    int16_t imm12 = (inst >> 10) & 0xfff;
+    imm12 = (int16_t)(imm12 << 4) >> 4;
+    int64_t real_guest_addr = UC_GR(uc)[rj] + imm12;
+    mem_addr = real_guest_addr;
+
+    switch (inst >> 22) {
+    case 0xa4: /* ST.B */
+        value = UC_GR(uc)[rd];
+        smc_store_shadow_page(mem_addr, value, 1);
+        break;
+    case 0xa5: /* ST.H */
+        value = UC_GR(uc)[rd];
+        smc_store_shadow_page(mem_addr, value, 2);
+        break;
+    case 0xa6: /* ST.W */
+        value = UC_GR(uc)[rd];
+        smc_store_shadow_page(mem_addr, value, 4);
+        break;
+    case 0xa7: /* ST.D */
+        value = UC_GR(uc)[rd];
+        smc_store_shadow_page(mem_addr, value, 8);
+        break;
+    case 0xb1: /* VST */
+        fd = rd + 1;
+        value = UC_FREG(uc)[fd].__val64[0];
+        smc_store_shadow_page(mem_addr, value, 8);
+        value = UC_FREG(uc)[fd].__val64[1];
+        smc_store_shadow_page(mem_addr + 8, value, 8);
+        break;
+    default:
+        fprintf(stderr, "%s:%d SMC unsupport inst %08x\n",
+                __func__, __LINE__, inst);
+        fflush(stderr);
+        g_assert_not_reached();
+        break;
+    }
+
+    return 0;
+}
+
+#endif
+
 /* 'pc' is the host PC at which the exception was raised. 'address' is
    the effective address of the memory exception. 'is_write' is 1 if a
    write caused the exception and otherwise 0'. 'old_set' is the
@@ -206,8 +317,17 @@ static inline int handle_cpu_signal(uintptr_t pc, siginfo_t *info,
     unsigned long address = (unsigned long)info->si_addr;
     MMUAccessType access_type = is_write ? MMU_DATA_STORE : MMU_DATA_LOAD;
 
+#ifdef CONFIG_LATX_SMC_OPT
+    int *emu = NULL;
+    int size = 0;
+    int emu_store = 0;
+    uint64_t guest_store_address;
+#endif
+
 #if defined(CONFIG_LATX_DEBUG)
     uintptr_t epc = pc;
+#endif
+#if defined(CONFIG_LATX_SMC_OPT) || defined(CONFIG_LATX_DEBUG)
 #ifndef CONFIG_LOONGARCH_NEW_WORLD
     mcontext_t * uc_mctx = (void *)old_set - 0x1540;
     ucontext_t *uc = container_of(uc_mctx, ucontext_t, uc_mcontext);
@@ -282,13 +402,50 @@ static inline int handle_cpu_signal(uintptr_t pc, siginfo_t *info,
      */
     if (is_write && info->si_signo == SIGSEGV && info->si_code == SEGV_ACCERR &&
         h2g_valid(address)) {
-        switch (page_unprotect(h2g(address), pc)) {
+#ifdef CONFIG_LATX_SMC_OPT
+        if (latx_smc_inv_page()) {
+            guest_store_address = h2g(address);
+            /* set @emu = NULL to invalidate all TB in this page */
+            emu = NULL;
+        } else {
+            /*
+             * pass @emu to page_unprotect() to only invalidate the those TB
+             * that is affected by the smc store.
+             * The *emu should contain the size of the store inst.
+             * when return:
+             *     if *emu = 1 : page is not writable, interpret the store
+             *     if *emu = 0 : page is writable, ok to return
+             */
+            guest_store_address = parse_guest_store(info, uc, &size);
+            emu_store = size;
+            emu = &emu_store;
+        }
+        switch (page_unprotect(guest_store_address, pc, emu)) {
+#else
+        switch (page_unprotect(h2g(address), pc, NULL)) {
+#endif
         case 0:
             /* Fault not caused by a page marked unwritable to protect
              * cached translations, must be the guest binary's problem.
              */
             break;
         case 1:
+#ifdef CONFIG_LATX_SMC_OPT
+            if (emu_store) {
+                /*
+                 * The page is not writable because there still are TB in this
+                 * page. The original store instruction needs to be interpret
+                 * here. The shadow page is used to allow write on this page.
+                 * During page_unprotect(), the shadow page will be created for
+                 * the page to be writen. So does the 2nd page if the store
+                 * cross the guest page boundary.
+                 */
+                mmap_lock();
+                smc_store_interpret(info, uc);
+                UC_PC(uc) += 0x4;
+                mmap_unlock();
+            }
+#endif
             /* Fault caused by protection of cached translation; TBs
              * invalidated, so resume execution.  Retain helper_retaddr
              * for a possible second fault.

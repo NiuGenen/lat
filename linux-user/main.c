@@ -676,6 +676,11 @@ static void handle_arg_latx_jrra(const char *arg)
     }
 }
 
+static void handle_arg_latx_smc(const char *arg)
+{
+    option_smc_opt = strtol(arg, NULL, 0);
+}
+
 static void handle_arg_latx_anonym(const char *arg)
 {
     option_anonym = strtol(arg, NULL, 0);
@@ -794,6 +799,8 @@ static const struct qemu_argument arg_table[] = {
 #ifdef CONFIG_LATX
     {"latx-optimize",   "LAT_OPTIMIZE",      false, handle_arg_optimize,
     "",           "specify enabled optimize type"},
+    {"latx-smc",        "LAT_SMC",          true,   handle_arg_latx_smc,
+    "",           "smc strategy: 0 (page,default) 1 (tb)"},
     {"latx-close-parallel",    "LATX_CLOSE_PARALLEL",     true,  handle_arg_latx_parallel,
     "",           "disable latx parallel"},
     {"latx-softfpu",    "LATX_SOFTFPU",     true,  handle_arg_latx_softfpu,

@@ -87,6 +87,8 @@
 #define CONFIG_LATX_IMM_REG         /* imm-reg optimization */
 #undef CONFIG_LATX_HBR
 #define CONFIG_LATX_HBR
+#undef CONFIG_LATX_SMC_OPT
+#define CONFIG_LATX_SMC_OPT
 #endif
 
 /**

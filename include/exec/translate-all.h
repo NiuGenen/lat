@@ -37,6 +37,6 @@ int latx_mprotect_one_page_rw(abi_ulong addr);
 int latx_mprotect_one_page_rw_resolv(abi_ulong addr);
 #ifdef CONFIG_USER_ONLY
 void page_protect(tb_page_addr_t page_addr);
-int page_unprotect(target_ulong address, uintptr_t pc);
+int page_unprotect(target_ulong address, uintptr_t pc, int *emu);
 #endif
 #endif /* TRANSLATE_ALL_H */
