@@ -345,6 +345,7 @@ target_ulong page_find_range_empty(target_ulong min, target_ulong max,
  */
 #ifdef CONFIG_USER_ONLY
 typedef struct ShadowPageDesc {
+    int is_shmm;
     void *p_addr;
     int64_t access_off;
 } ShadowPageDesc;
@@ -352,7 +353,7 @@ typedef struct ShadowPageDesc {
 
 void *page_get_target_data(target_ulong address);
 void page_reset_target_data(target_ulong start, target_ulong end);
-void set_shadow_page(target_ulong orig_page, void *shadow_p, int64_t access_off);
+void *set_shadow_page(target_ulong orig_page, void *shadow_p, int64_t access_off);
 int shared_private_interpret(siginfo_t *info, ucontext_t *uc);
 int lock_interpret(siginfo_t *info, ucontext_t *uc);
 #if defined(CONFIG_LATX_KZT)

@@ -493,6 +493,18 @@ static bool is_shadow_page(target_ulong address)
     return page_get_target_data(address);
 }
 
+static bool is_shadow_page_shmm(target_ulong address)
+{
+    ShadowPageDesc *spd = page_get_target_data(address);
+    return spd && spd->is_shmm;
+}
+
+static bool is_shadow_page_not_shmm(target_ulong address)
+{
+    ShadowPageDesc *spd = page_get_target_data(address);
+    return spd && !(spd->is_shmm);
+}
+
 #ifndef CONFIG_USER_ONLY
 PageDesc *page_find_alloc(tb_page_addr_t index, int alloc)
 {
@@ -2298,7 +2310,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
      * but the paired page cross 16K boundary is still not protected.
      */
     int p_flags = page_get_flags(pc);
-    if ((p_flags & PAGE_WRITE) && !is_shadow_page(pc)) {
+    if ((p_flags & PAGE_WRITE) && !is_shadow_page_not_shmm(pc)) {
         mprotect((void*)(pc & qemu_host_page_mask), qemu_host_page_size, PROT_READ);
     }
 
@@ -3942,7 +3954,7 @@ void page_protect(tb_page_addr_t address)
         }
 
         pageflags_set_clear(start, last, 0, PAGE_WRITE);
-        if (!is_shadow_page(address)) {
+        if (!is_shadow_page_not_shmm(address)) {
             mprotect(g2h_untagged(start), qemu_host_page_size,
                     (prot & PAGE_BITS) & ~PAGE_WRITE);
         }
@@ -4074,6 +4086,7 @@ static int smc_create_shadow_page_shmm(uint64_t start)
     void *host_start, *ptr, *shmm_ptr;
     int64_t access_off;
     int prot;
+    ShadowPageDesc *spd;
 
     /* can NOT use shmm if guest page is not MAP_ANON */
     if (smc_shmm_checke_page_anon(start, &prot)) {
@@ -4130,7 +4143,8 @@ static int smc_create_shadow_page_shmm(uint64_t start)
      */
     access_off = (int64_t)shmm_ptr - (int64_t)real_start;
     for (addr = real_start; addr < real_end; addr += TARGET_PAGE_SIZE) {
-        set_shadow_page(addr, shmm_ptr, access_off);
+        spd = set_shadow_page(addr, shmm_ptr, access_off);
+        spd->is_shmm = 1;
     }
 
     return 0;
@@ -4139,6 +4153,13 @@ static int smc_create_shadow_page_shmm(uint64_t start)
 #define SMC_CREATE_SHADOW_PAGE_SHMM(address, p) do {                        \
     if (!is_shadow_page(address) && !(p->flags & PAGE_WRITE)) {             \
         smc_create_shadow_page_shmm(address & qemu_host_page_mask);         \
+    }                                                                       \
+} while (0)
+
+#define SMC_SHMM_RECOVER_WRITE(address, flags) do {                         \
+    if (is_shadow_page_shmm(address)) {                                     \
+        mprotect(g2h_untagged(address & qemu_host_page_mask),               \
+                 qemu_host_page_size, flags);                               \
     }                                                                       \
 } while (0)
 
@@ -4307,6 +4328,13 @@ int page_unprotect(target_ulong address, uintptr_t pc, int *emu)
                     }
                     /* no need interpret since the pages are writable */
                     *emu = 0;
+                    /* make guest page writable if shmm used */
+                    if (latx_smc_shmm()) {
+                        SMC_SHMM_RECOVER_WRITE(address, p->flags & PAGE_BITS);
+                        if (is_cross) {
+                            SMC_SHMM_RECOVER_WRITE(address2, p2->flags & PAGE_BITS);
+                        }
+                    }
                 } else {
                     start = address & qemu_host_page_mask;
                     len = qemu_host_page_size;
@@ -4338,6 +4366,9 @@ int page_unprotect(target_ulong address, uintptr_t pc, int *emu)
                      */
                     if ((prot & PAGE_WRITE) && !is_cross_host) {
                         *emu = 0;
+                        if (latx_smc_shmm()) {
+                            SMC_SHMM_RECOVER_WRITE(address, prot & PAGE_BITS);
+                        }
                     } else {
                         *emu = 1;
                     }
@@ -4378,7 +4409,7 @@ int page_unprotect(target_ulong address, uintptr_t pc, int *emu)
             if (prot & PAGE_EXEC) {
                 prot = (prot & ~PAGE_EXEC) | PAGE_READ;
             }
-            if (!is_shadow_page(address)) {
+            if (!is_shadow_page_not_shmm(address)) {
                 mprotect((void *)g2h_untagged(start), len, prot & PAGE_BITS);
             }
         }
@@ -4637,7 +4668,7 @@ void tcg_flush_softmmu_tlb(CPUState *cs)
 }
 
 #ifdef CONFIG_USER_ONLY
-void set_shadow_page(target_ulong orig_page, void *shadow_p, int64_t access_off)
+void *set_shadow_page(target_ulong orig_page, void *shadow_p, int64_t access_off)
 {
     ShadowPageDesc *shadow_pd = page_get_target_data(orig_page);
     if (shadow_pd == NULL) {
@@ -4664,6 +4695,7 @@ void set_shadow_page(target_ulong orig_page, void *shadow_p, int64_t access_off)
         spm_clear(orig_page, TARGET_PAGE_SIZE);
         mmap_unlock();
     }
+    return shadow_pd;
 }
 /*
  * Now, we assume that it's not the worst case in the target_mmap.
