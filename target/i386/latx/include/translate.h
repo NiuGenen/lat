@@ -219,6 +219,7 @@ TRANS_FUNC_DEF(prefetcht0);
 TRANS_FUNC_DEF(prefetcht1);
 TRANS_FUNC_DEF(prefetcht2);
 TRANS_FUNC_DEF(movaps);
+TRANS_FUNC_DEF(movaps_vst_x4);
 TRANS_FUNC_DEF(movapd);
 TRANS_FUNC_DEF(cvtpi2ps);
 TRANS_FUNC_DEF(cvtpi2pd);

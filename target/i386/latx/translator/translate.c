@@ -2199,6 +2199,25 @@ int tr_ir2_generate(struct TranslationBlock *tb)
             }
         }
 
+#ifdef CONFIG_LATX_SMC_OPT
+        /* TODO: should use inst pattern */
+        if (tb_use_smc_opt(tb) && (i + 3) < ir1_nr &&
+            !(pir1->cflag & IR1_INVALID_MASK) &&
+            (ir1_opcode(pir1)     == dt_X86_INS_MOVAPS  ||
+             ir1_opcode(pir1)     == dt_X86_INS_MOVDQA) &&
+             ir1_opcode(pir1 + 1) == dt_X86_INS_MOVAPS  &&
+             ir1_opcode(pir1 + 2) == dt_X86_INS_MOVAPS  &&
+             ir1_opcode(pir1 + 3) == dt_X86_INS_MOVAPS)
+        {
+            if (translate_movaps_vst_x4(pir1)) {
+                pir1[0].cflag |= IR1_INVALID_MASK;
+                pir1[1].cflag |= IR1_INVALID_MASK;
+                pir1[2].cflag |= IR1_INVALID_MASK;
+                pir1[3].cflag |= IR1_INVALID_MASK;
+            }
+        }
+#endif
+
         bool translation_success =
             (pir1->cflag & IR1_INVALID_MASK) || ir1_translate(pir1);
         if (!translation_success) {

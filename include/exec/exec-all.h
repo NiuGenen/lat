@@ -674,9 +674,26 @@ struct TranslationBlock {
 #ifdef CONFIG_LATX_MONITOR_SHARED_MEM
     unsigned long checksum;
 #endif
+#ifdef CONFIG_LATX_SMC_OPT
+#define TBSMC_COUNT_MASK        0xffff
+#define TBSMC_OPT_THRESHOLD     0xff
+#define TBSMC_OPTED_MASK        (0x1 << 16)
+    unsigned long smc_data;
+#endif
     struct separated_data *s_data;
 #endif
 };
+
+#ifdef CONFIG_LATX_SMC_OPT
+static inline int tb_use_smc_opt(TranslationBlock *tb)
+{
+    if (tb) {
+        return tb->smc_data & TBSMC_OPTED_MASK;
+    } else {
+        return 0;
+    }
+}
+#endif
 
 #define TB_MAGIC 0xbeefUL
 #define HOST_VIRT_ADDR_SPACE_BITS 48
