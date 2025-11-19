@@ -5,6 +5,7 @@
 #include "latx-options.h"
 #include "translate.h"
 #include "hbr.h"
+#include "latx-smc.h"
 bool translate_pop(IR1_INST *pir1)
 {
     IR2_OPND esp_opnd = ra_alloc_gpr(esp_index);
@@ -309,7 +310,40 @@ static void translate_mov_from_gpr(IR1_OPND *opnd0, IR1_OPND *opnd1)
             store_ireg_to_ir1(temp, opnd0, false);
             ra_free_temp(temp);
         } else {
+#ifdef CONFIG_LATX_SMC_OPT
+            if (tb_use_smc_opt(lsenv->tr_data->curr_tb) &&
+                ir1_opnd_is_mem(opnd0))
+            {
+                IR2_OPND label_finish = ra_alloc_label();
+                IR2_OPND tmp = ra_alloc_itemp();
+                int offset;
+                IR2_OPND mem = convert_mem(opnd0, &offset);
+                li_w(tmp, offset);
+                la_add_d(tmp, mem, tmp);
+                // save context
+                tr_save_registers_to_env(0xff, 0x0, 0x0, 0);
+                tr_save_x64_8_registers_to_env(0xff, 0x0);
+                // call smc_store_helper
+                la_mov64(a0_ir2_opnd, env_ir2_opnd);
+                la_mov64(a1_ir2_opnd, tmp);
+                la_mov64(a2_ir2_opnd, src);
+                la_ori(a3_ir2_opnd, zero_ir2_opnd, ir1_opnd_size(opnd0) / 8);
+                li_host_addr(tmp, smc_store_helper_st);
+                la_jirl(ra_ir2_opnd, tmp, 0);
+                // restore context
+                tr_load_registers_from_env(0xff, 0x0, 0x0, 0);
+                tr_load_x64_8_registers_from_env(0xff, 0x0);
+                // beq a0, finish
+                la_beq(a0_ir2_opnd, zero_ir2_opnd, label_finish);
+                store_ireg_to_ir1(src, opnd0, false);
+                // --> finish
+                la_label(label_finish);
+            } else {
+                store_ireg_to_ir1(src, opnd0, false);
+            }
+#else
             store_ireg_to_ir1(src, opnd0, false);
+#endif
         }
     }
 }

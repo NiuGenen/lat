@@ -78,6 +78,7 @@
 #include "aot_page.h"
 #include "accel/tcg/internal.h"
 #include "ts.h"
+#include "latx-smc.h"
 #endif
 #ifdef CONFIG_LATX_TU
 void tu_reset_tb(TranslationBlock *tb);
@@ -133,6 +134,54 @@ void tu_reset_tb(TranslationBlock *tb);
     } \
     result; \
 })  /* EXPAND_TO_64BIT */
+
+#ifdef CONFIG_LATX_SMC_OPT
+
+/*
+ * Retranslation strategy for SMC optimization.
+ *
+ * During the SMC process, the number of segv signal will be accumulated
+ * to identify those TB that often write on smc-protected page. The profiling
+ * is executed at handle_cpu_signal() -> page_unprotect() ->
+ */
+static __thread GTree *smc_retrans_tree;
+static gint smc_retrans_cmp(gconstpointer ap, gconstpointer bp)
+{
+    const uint64_t *a = ap;
+    const uint64_t *b = bp;
+    if (*a > *b) {
+        return 1;
+    } else if (*a < *b) {
+        return -1;
+    }
+    return 0;
+}
+static inline void smc_retrans_tree_init(void)
+{
+    if (smc_retrans_tree) return;
+    smc_retrans_tree = g_tree_new(smc_retrans_cmp);
+}
+static inline void *smc_retrans_lookup(uint64_t pc)
+{
+    if (!smc_retrans_tree) return NULL;
+    return g_tree_lookup(smc_retrans_tree, &pc);
+}
+static inline void smc_retrans_remove(uint64_t pc)
+{
+    if (!smc_retrans_tree) return;
+    g_tree_remove(smc_retrans_tree, &pc);
+}
+static bool smc_retrans_insert(TranslationBlock *tb)
+{
+    if (!smc_retrans_tree) return false;
+    if (!smc_retrans_lookup(tb->pc)) {
+        g_tree_insert(smc_retrans_tree, &tb->pc, tb);
+        return true;
+    }
+    return false;
+}
+
+#endif
 
 /**
  * struct page_entry - page descriptor entry
@@ -2117,6 +2166,12 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
 #ifdef CONFIG_LATX_JRRA
     tb->next_86_pc = 0;
     tb->return_target_ptr = NULL;
+#endif
+#ifdef CONFIG_LATX_SMC_OPT
+    if (smc_retrans_lookup(pc)) {
+        tb->smc_data |= TBSMC_OPTED_MASK;
+        smc_retrans_remove(pc);
+    }
 #endif
 #endif
 
@@ -4150,6 +4205,30 @@ static int smc_create_shadow_page_shmm(uint64_t start)
     return 0;
 }
 
+#ifdef CONFIG_LATX_SMC_OPT
+
+static void smc_retrans_triger(TranslationBlock *ctb)
+{
+    if (!latx_smc_use_store_helper()) return;
+
+    if (!ctb) return;
+    /* already optomized for SMC */
+    if (ctb->smc_data & TBSMC_OPTED_MASK) return;
+
+    int count = (ctb->smc_data & TBSMC_COUNT_MASK) + 1;
+    if (count > TBSMC_OPT_THRESHOLD) {
+        smc_retrans_tree_init();
+        if (smc_retrans_insert(ctb)) {
+            tb_phys_invalidate__locked(ctb);
+        }
+    } else {
+        ctb->smc_data &= ~TBSMC_COUNT_MASK;
+        ctb->smc_data |= count & TBSMC_COUNT_MASK;
+    }
+}
+
+#endif
+
 #define SMC_CREATE_SHADOW_PAGE_SHMM(address, p) do {                        \
     if (!is_shadow_page(address) && !(p->flags & PAGE_WRITE)) {             \
         smc_create_shadow_page_shmm(address & qemu_host_page_mask);         \
@@ -4182,6 +4261,145 @@ static int smc_create_shadow_page_shmm(uint64_t start)
     }                                                                       \
 } while (0)
 
+/* TODO: handle cross page */
+#define SMC_HELPER_CHECK(spd, p, addr, addr2, size) do {    \
+    if (!(spd)) return 1;                                   \
+    if (!((p)->flags & PAGE_WRITE_ORG)) return 1;           \
+    (address2) = (address) + (size) - 1;                    \
+    if (((address)  & TARGET_PAGE_MASK) !=                  \
+        ((address2) & TARGET_PAGE_MASK)) {                  \
+        return 1;                                           \
+    }                                                       \
+} while (0)
+
+/* TODO: fix if current tb modified in smc store helper */
+#ifdef SMC_HELPER_USE_PAGE_UNPROTECT
+#define SMC_HELPER_TBINV(address, pc, size, p) do {             \
+    page_unprotect((address), (pc), &(size));                   \
+} while (0)
+#else
+#define SMC_HELPER_TBINV(address, pc, size, p) do {             \
+    tb_invalidate_phys_page_unwind((address), (pc), &(size));   \
+    if (!(size)) {                                              \
+        SMC_ENABLE_PAGE_WRITE((address), (p));                  \
+    }                                                           \
+} while (0)
+#endif
+
+int smc_store_helper_vst_x4(void *env,
+        uint64_t address, int r0, int r1, int r2, int r3)
+{
+    ShadowPageDesc *spd = page_get_target_data(address);
+    PageFlagsNode *p = pageflags_find(address, address);
+    uint64_t pc = GETPC();
+    uint64_t address2;
+    int size = 16 * 4;
+    uint64_t val[2];
+    int64_t mem_addr;
+
+    SMC_HELPER_CHECK(spd, p, address, address2, size);
+
+    mmap_lock();
+
+    /* finish the store inst with shadow page */
+    mem_addr = (int64_t)address + spd->access_off;
+    smc_hook_get_xmm(env, r0, val);
+    *(uint64_t*)(mem_addr + 8 * 0) = val[0];
+    *(uint64_t*)(mem_addr + 8 * 1) = val[1];
+    smc_hook_get_xmm(env, r1, val);
+    *(uint64_t*)(mem_addr + 8 * 2) = val[0];
+    *(uint64_t*)(mem_addr + 8 * 3) = val[1];
+    smc_hook_get_xmm(env, r2, val);
+    *(uint64_t*)(mem_addr + 8 * 4) = val[0];
+    *(uint64_t*)(mem_addr + 8 * 5) = val[1];
+    smc_hook_get_xmm(env, r3, val);
+    *(uint64_t*)(mem_addr + 8 * 6) = val[0];
+    *(uint64_t*)(mem_addr + 8 * 7) = val[1];
+
+    /* This guest page is writable : no SMC */
+    if (p->flags & PAGE_WRITE) {
+        goto do_return;
+    }
+
+    /* This guest page is not writable : check SMC */
+    SMC_HELPER_TBINV(address, pc, size, p);
+
+do_return:
+    mmap_unlock();
+    return 0;
+}
+
+int smc_store_helper_vst(void *env,
+        uint64_t address, uint64_t val0, uint64_t val1)
+{
+    ShadowPageDesc *spd = page_get_target_data(address);
+    PageFlagsNode *p = pageflags_find(address, address);
+    uint64_t pc = GETPC();
+    uint64_t address2;
+    int size = 16;
+    int64_t mem_addr;
+
+    SMC_HELPER_CHECK(spd, p, address, address2, size);
+
+    mmap_lock();
+
+    /* finish the store inst with shadow page */
+    mem_addr = (int64_t)address + spd->access_off;
+    *(uint64_t*)(mem_addr + 0) = val0;
+    *(uint64_t*)(mem_addr + 8) = val1;
+
+    /* This guest page is writable : no SMC */
+    if (p->flags & PAGE_WRITE) {
+        goto do_return;
+    }
+
+    /* This guest page is not writable : check SMC */
+    SMC_HELPER_TBINV(address, pc, size, p);
+
+do_return:
+    mmap_unlock();
+    return 0;
+}
+
+int smc_store_helper_st(void *env,
+        uint64_t address, uint64_t val, int s)
+{
+    ShadowPageDesc *spd = page_get_target_data(address);
+    PageFlagsNode *p = pageflags_find(address, address);
+    uint64_t pc = GETPC();
+    uint64_t address2;
+    int size = s; // 1,2,4,8
+    int64_t mem_addr;
+
+    SMC_HELPER_CHECK(spd, p, address, address2, size);
+
+    mmap_lock();
+
+    /* finish the store inst with shadow page */
+    mem_addr = (int64_t)address + spd->access_off;
+    switch (size) {
+    case 8: *(uint64_t *)(mem_addr) = (uint64_t)val; break;
+    case 4: *(uint32_t *)(mem_addr) = (uint32_t)val; break;
+    case 2: *(uint16_t *)(mem_addr) = (uint16_t)val; break;
+    case 1: *(uint8_t  *)(mem_addr) = (uint8_t )val; break;
+    default:
+        mmap_unlock();
+        return 1;
+    }
+
+    /* This guest page is writable : no SMC */
+    if (p->flags & PAGE_WRITE) {
+        goto do_return;
+    }
+
+    /* This guest page is not writable : check SMC */
+    SMC_HELPER_TBINV(address, pc, size, p);
+
+do_return:
+    mmap_unlock();
+    return 0;
+}
+
 /* called from signal handler: invalidate the code and unprotect the
  * page. Return 0 if the fault was not handled, 1 if it was handled,
  * and 2 if it was handled but the caller must cause the TB to be
@@ -4207,6 +4425,10 @@ int page_unprotect(target_ulong address, uintptr_t pc, int *emu)
        know this only ever happens in a synchronous SEGV handler, so in
        practice it seems to be ok.  */
     mmap_lock();
+
+#ifdef CONFIG_LATX_SMC_OPT
+    smc_retrans_triger(tcg_tb_lookup(pc));
+#endif
 
     if (emu) {
         inv_one_tb = 1;

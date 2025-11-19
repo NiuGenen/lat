@@ -3,6 +3,7 @@
 #include "latx-options.h"
 #include "translate.h"
 #include "hbr.h"
+#include "latx-smc.h"
 
 bool translate_movdq2q(IR1_INST *pir1)
 {
@@ -252,6 +253,144 @@ bool translate_lddqu(IR1_INST *pir1)
     translate_movaps(pir1);
     return true;
 }
+
+bool translate_movaps_vst_x4(IR1_INST *pir1)
+{
+    IR1_INST *p0 = pir1;
+    IR1_INST *p1 = pir1 + 1;
+    IR1_INST *p2 = pir1 + 2;
+    IR1_INST *p3 = pir1 + 3;
+
+    IR1_OPND *dest0 = ir1_get_opnd(p0, 0);
+    IR1_OPND *dest1 = ir1_get_opnd(p1, 0);
+    IR1_OPND *dest2 = ir1_get_opnd(p2, 0);
+    IR1_OPND *dest3 = ir1_get_opnd(p3, 0);
+
+    if (!ir1_opnd_is_mem(dest0)) return false;
+    if (!ir1_opnd_is_mem(dest1)) return false;
+    if (!ir1_opnd_is_mem(dest2)) return false;
+    if (!ir1_opnd_is_mem(dest3)) return false;
+
+    if (ir1_opnd_has_index(dest0)) return false;
+    if (ir1_opnd_has_index(dest1)) return false;
+    if (ir1_opnd_has_index(dest2)) return false;
+    if (ir1_opnd_has_index(dest3)) return false;
+
+    int base0 = ir1_opnd_base_reg(dest0);
+    int base1 = ir1_opnd_base_reg(dest1);
+    int base2 = ir1_opnd_base_reg(dest2);
+    int base3 = ir1_opnd_base_reg(dest3);
+
+    if (!(base0 == base1 && base1 == base2 && base2 == base3)) {
+        return false;
+    }
+
+    int off0 = ir1_opnd_simm(dest0);
+    int off1 = ir1_opnd_simm(dest1);
+    int off2 = ir1_opnd_simm(dest2);
+    int off3 = ir1_opnd_simm(dest3);
+
+#define A16(n)  ((n)+16)
+#define A16OK(o0, o1, o2, o3)   \
+    (A16(o0) == (o1) && A16(o1) == (o2) && A16(o2) == (o3))
+#define B16OK(o0, o1, o2, o3)   \
+    (A16(o3) == (o2) && A16(o2) == (o1) && A16(o1) == (o0))
+    int a16ok = A16OK(off0, off1, off2, off3);
+    int b16ok = B16OK(off0, off1, off2, off3);
+    if (!a16ok && !b16ok) return false;
+
+    IR1_OPND *src0 = ir1_get_opnd(p0, 1);
+    IR1_OPND *src1 = ir1_get_opnd(p1, 1);
+    IR1_OPND *src2 = ir1_get_opnd(p2, 1);
+    IR1_OPND *src3 = ir1_get_opnd(p3, 1);
+
+    if (!ir1_opnd_is_xmm(src0)) return false;
+    if (!ir1_opnd_is_xmm(src1)) return false;
+    if (!ir1_opnd_is_xmm(src2)) return false;
+    if (!ir1_opnd_is_xmm(src3)) return false;
+
+    int r0 = ir1_opnd_base_reg_num(src0);
+    int r1 = ir1_opnd_base_reg_num(src1);
+    int r2 = ir1_opnd_base_reg_num(src2);
+    int r3 = ir1_opnd_base_reg_num(src3);
+
+    int xmm = 0;
+    xmm |= (0x1 << r0);
+    xmm |= (0x1 << r1);
+    xmm |= (0x1 << r2);
+    xmm |= (0x1 << r3);
+
+    IR2_OPND label_finish = ra_alloc_label();
+    IR2_OPND tmp = ra_alloc_itemp();
+    IR2_OPND mem;
+    int offset;
+    if (a16ok) {
+        mem = convert_mem(dest0, &offset);
+        li_w(tmp, offset);
+        la_add_d(tmp, mem, tmp);
+    } else if (b16ok) {
+        mem = convert_mem(dest3, &offset);
+        li_w(tmp, offset);
+        la_add_d(tmp, mem, tmp);
+    }
+
+    // save context
+    tr_save_registers_to_env(0xff, 0x0, xmm & 0xff, 0);
+    tr_save_x64_8_registers_to_env(0xff, (xmm >> 8) & 0xff);
+
+    // call helper
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    la_mov64(a1_ir2_opnd, tmp);
+    if (a16ok) {
+        la_ori(a2_ir2_opnd, zero_ir2_opnd, r0);
+        la_ori(a3_ir2_opnd, zero_ir2_opnd, r1);
+        la_ori(a4_ir2_opnd, zero_ir2_opnd, r2);
+        la_ori(a5_ir2_opnd, zero_ir2_opnd, r3);
+    } else if (b16ok) {
+        la_ori(a2_ir2_opnd, zero_ir2_opnd, r3);
+        la_ori(a3_ir2_opnd, zero_ir2_opnd, r2);
+        la_ori(a4_ir2_opnd, zero_ir2_opnd, r1);
+        la_ori(a5_ir2_opnd, zero_ir2_opnd, r0);
+    }
+    li_host_addr(tmp, smc_store_helper_vst_x4);
+    la_jirl(ra_ir2_opnd, tmp, 0);
+
+    // restore context
+    tr_load_registers_from_env(0xff, 0x0, 0x0, 0);
+    tr_load_x64_8_registers_from_env(0xff, 0x0);
+
+    // beq a0, finish
+    la_beq(a0_ir2_opnd, zero_ir2_opnd, label_finish);
+
+    IR2_OPND ir2_opnd_addr;
+
+    store_freg128_to_ir1_mem(ra_alloc_xmm(r0), dest0);
+
+    ir2_opnd_build(&ir2_opnd_addr, IR2_OPND_IMM, ir1_addr(p1));
+    la_x86_inst(ir2_opnd_addr);
+    store_freg128_to_ir1_mem(ra_alloc_xmm(r1), dest1);
+
+    ir2_opnd_build(&ir2_opnd_addr, IR2_OPND_IMM, ir1_addr(p2));
+    la_x86_inst(ir2_opnd_addr);
+    store_freg128_to_ir1_mem(ra_alloc_xmm(r2), dest2);
+
+    ir2_opnd_build(&ir2_opnd_addr, IR2_OPND_IMM, ir1_addr(p3));
+    la_x86_inst(ir2_opnd_addr);
+    store_freg128_to_ir1_mem(ra_alloc_xmm(r3), dest3);
+
+    // --> finish
+    la_label(label_finish);
+
+    return true;
+}
+
+void smc_hook_get_xmm(void *_env, int reg, uint64_t *val)
+{
+    CPUX86State *env = _env;
+    val[0] = env->xmm_regs[reg]._q_ZMMReg[0];
+    val[1] = env->xmm_regs[reg]._q_ZMMReg[1];
+}
+
 bool translate_movaps(IR1_INST *pir1)
 {
     IR1_OPND *dest = ir1_get_opnd(pir1, 0);
@@ -260,8 +399,46 @@ bool translate_movaps(IR1_INST *pir1)
         load_freg128_from_ir1_mem(ra_alloc_xmm(ir1_opnd_base_reg_num(dest)),
                                   src);
     } else if (ir1_opnd_is_mem(dest) && ir1_opnd_is_xmm(src)) {
+#ifdef CONFIG_LATX_SMC_OPT
+        if (tb_use_smc_opt(lsenv->tr_data->curr_tb) &&
+            (ir1_opcode(pir1) == dt_X86_INS_MOVAPS ||
+             ir1_opcode(pir1) == dt_X86_INS_MOVDQA))
+        {
+            IR2_OPND label_finish = ra_alloc_label();
+            IR2_OPND tmp = ra_alloc_itemp();
+            int offset;
+            IR2_OPND mem = convert_mem(dest, &offset);
+            li_w(tmp, offset);
+            la_add_d(tmp, mem, tmp);
+            // save context
+            tr_save_registers_to_env(0xff, 0x0, 0x0, 0);
+            tr_save_x64_8_registers_to_env(0xff, 0x0);
+            // call smc_store_helper
+            la_mov64(a0_ir2_opnd, env_ir2_opnd);
+            la_mov64(a1_ir2_opnd, tmp);
+            la_vpickve2gr_d(a2_ir2_opnd,
+              ra_alloc_xmm(ir1_opnd_base_reg_num(src)), 0);
+            la_vpickve2gr_d(a3_ir2_opnd,
+              ra_alloc_xmm(ir1_opnd_base_reg_num(src)), 1);
+            li_host_addr(tmp, smc_store_helper_vst);
+            la_jirl(ra_ir2_opnd, tmp, 0);
+            // restore context
+            tr_load_registers_from_env(0xff, 0x0, 0x0, 0);
+            tr_load_x64_8_registers_from_env(0xff, 0x0);
+            // beq a0, finish
+            la_beq(a0_ir2_opnd, zero_ir2_opnd, label_finish);
+            store_freg128_to_ir1_mem(ra_alloc_xmm(ir1_opnd_base_reg_num(src)),
+                                     dest);
+            // --> finish
+            la_label(label_finish);
+        } else {
+            store_freg128_to_ir1_mem(ra_alloc_xmm(ir1_opnd_base_reg_num(src)),
+                                     dest);
+        }
+#else
         store_freg128_to_ir1_mem(ra_alloc_xmm(ir1_opnd_base_reg_num(src)),
                                  dest);
+#endif
     } else if (ir1_opnd_is_xmm(dest) && ir1_opnd_is_xmm(src)) {
         la_vori_b(ra_alloc_xmm(ir1_opnd_base_reg_num(dest)),
                   ra_alloc_xmm(ir1_opnd_base_reg_num(src)), 0);
