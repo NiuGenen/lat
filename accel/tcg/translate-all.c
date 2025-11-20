@@ -4272,19 +4272,31 @@ static void smc_retrans_triger(TranslationBlock *ctb)
     }                                                       \
 } while (0)
 
-/* TODO: fix if current tb modified in smc store helper */
 #ifdef SMC_HELPER_USE_PAGE_UNPROTECT
-#define SMC_HELPER_TBINV(address, pc, size, p) do {             \
-    page_unprotect((address), (pc), &(size));                   \
+#define SMC_HELPER_TBINV(address, pc, size, p, ret) do {                \
+    ret = page_unprotect((address), (pc), &(size));                     \
+    if (!ret) g_assert_not_reached();                                   \
 } while (0)
 #else
-#define SMC_HELPER_TBINV(address, pc, size, p) do {             \
-    tb_invalidate_phys_page_unwind((address), (pc), &(size));   \
-    if (!(size)) {                                              \
-        SMC_ENABLE_PAGE_WRITE((address), (p));                  \
-    }                                                           \
+#define SMC_HELPER_TBINV(address, pc, size, p, ret) do {                \
+    ret = tb_invalidate_phys_page_unwind((address), (pc), &(size));     \
+    if (!(size)) {                                                      \
+        SMC_ENABLE_PAGE_WRITE((address), (p));                          \
+    }                                                                   \
+    ret = ret ? 2 : 1;                                                  \
 } while (0)
 #endif
+
+/* If current TB is modified, restore cpu state and exit cpu loop.
+ * Guest PC is restored during TB invalidation. */
+#define SMC_HELPER_TBINV_AFTER(ret, env) do {                           \
+    if (ret == 2) {                                                     \
+        mmap_unlock();                                                  \
+        smc_store_helper_restore_cpu_state(env);                        \
+        cpu_loop_exit_noexc(env_cpu(env));                              \
+        g_assert_not_reached();                                         \
+    }                                                                   \
+} while (0)
 
 int smc_store_helper_vst_x4(void *env,
         uint64_t address, int r0, int r1, int r2, int r3)
@@ -4296,6 +4308,7 @@ int smc_store_helper_vst_x4(void *env,
     int size = 16 * 4;
     uint64_t val[2];
     int64_t mem_addr;
+    int ret;
 
     SMC_HELPER_CHECK(spd, p, address, address2, size);
 
@@ -4322,7 +4335,8 @@ int smc_store_helper_vst_x4(void *env,
     }
 
     /* This guest page is not writable : check SMC */
-    SMC_HELPER_TBINV(address, pc, size, p);
+    SMC_HELPER_TBINV(address, pc, size, p, ret);
+    SMC_HELPER_TBINV_AFTER(ret, env);
 
 do_return:
     mmap_unlock();
@@ -4338,6 +4352,7 @@ int smc_store_helper_vst(void *env,
     uint64_t address2;
     int size = 16;
     int64_t mem_addr;
+    int ret;
 
     SMC_HELPER_CHECK(spd, p, address, address2, size);
 
@@ -4354,7 +4369,8 @@ int smc_store_helper_vst(void *env,
     }
 
     /* This guest page is not writable : check SMC */
-    SMC_HELPER_TBINV(address, pc, size, p);
+    SMC_HELPER_TBINV(address, pc, size, p, ret);
+    SMC_HELPER_TBINV_AFTER(ret, env);
 
 do_return:
     mmap_unlock();
@@ -4370,6 +4386,7 @@ int smc_store_helper_st(void *env,
     uint64_t address2;
     int size = s; // 1,2,4,8
     int64_t mem_addr;
+    int ret;
 
     SMC_HELPER_CHECK(spd, p, address, address2, size);
 
@@ -4393,7 +4410,8 @@ int smc_store_helper_st(void *env,
     }
 
     /* This guest page is not writable : check SMC */
-    SMC_HELPER_TBINV(address, pc, size, p);
+    SMC_HELPER_TBINV(address, pc, size, p, ret);
+    SMC_HELPER_TBINV_AFTER(ret, env);
 
 do_return:
     mmap_unlock();

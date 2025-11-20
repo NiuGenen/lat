@@ -11,6 +11,8 @@
 #include "ir2-relocate.h"
 #include "tu.h"
 #include "imm-cache.h"
+#include "latx-smc.h"
+#include "latx-native-asm.h"
 
 extern void *helper_tb_lookup_ptr(CPUArchState *);
 static int ss_generate_match_fail_native_code(void* code_buf);
@@ -4198,4 +4200,41 @@ void tr_lat_spin_unlock(IR2_OPND lat_lock_addr)
     la_dbar(0);
     la_st_w(zero_ir2_opnd, lat_lock_addr, 0);
     ra_free_temp(lat_lock_addr);
+}
+
+/* Restore CPUX86State from CPU.
+ *
+ * The guest cpu state is partially saved in TB before calling the
+ * smc_store_helper to reduce overhead. When the SMC operation
+ * modifies the current executing TB, it should invalidate this TB
+ * and exit cpu loop immediately. Here we should restore the guest
+ * cpu state completely from real hardware context.
+ *
+ * GPR      already saved
+ * FPR      not saved
+ * XMM      partially saved (for smc_store_helper_vst_x4)
+ * EFLAGS   already saved
+ * FTOP     already saved
+ */
+void smc_store_helper_restore_cpu_state(void *_env)
+{
+    CPUX86State *env = _env;
+    int i, nb_xmm_regs;
+#ifdef TARGET_X86_64
+    nb_xmm_regs = 16;
+#else
+    nb_xmm_regs = 8;
+#endif
+
+    for (i = 0; i < 8; i++) {
+        __fst64_native_freg(&(env->fpregs[i].mmx.MMX_Q(0)), i);
+    }
+
+    for (i = 0; i < nb_xmm_regs; i++) {
+        if (option_enable_lasx) {
+            __vst256_native_vreg(&(env->xmm_regs[i].ZMM_Q(0)), i);
+        } else {
+            __vst128_native_vreg(&(env->xmm_regs[i].ZMM_Q(0)), i);
+        }
+    }
 }
