@@ -328,7 +328,8 @@ static void translate_mov_from_gpr(IR1_OPND *opnd0, IR1_OPND *opnd1)
                 la_mov64(a1_ir2_opnd, tmp);
                 la_mov64(a2_ir2_opnd, src);
                 la_ori(a3_ir2_opnd, zero_ir2_opnd, ir1_opnd_size(opnd0) / 8);
-                li_host_addr(tmp, smc_store_helper_st);
+                aot_load_host_addr(tmp, (ADDR)smc_store_helper_st,
+                        LOAD_HELPER_SMC_ST, 0);
                 la_jirl(ra_ir2_opnd, tmp, 0);
                 // restore context
                 tr_load_registers_from_env(0xff, 0x0, 0x0, 0);

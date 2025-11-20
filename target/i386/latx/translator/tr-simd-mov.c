@@ -352,7 +352,8 @@ bool translate_movaps_vst_x4(IR1_INST *pir1)
         la_ori(a4_ir2_opnd, zero_ir2_opnd, r1);
         la_ori(a5_ir2_opnd, zero_ir2_opnd, r0);
     }
-    li_host_addr(tmp, smc_store_helper_vst_x4);
+    aot_load_host_addr(tmp, (ADDR)smc_store_helper_vst_x4,
+            LOAD_HELPER_SMC_VST_X4, 0);
     la_jirl(ra_ir2_opnd, tmp, 0);
 
     // restore context
@@ -420,7 +421,8 @@ bool translate_movaps(IR1_INST *pir1)
               ra_alloc_xmm(ir1_opnd_base_reg_num(src)), 0);
             la_vpickve2gr_d(a3_ir2_opnd,
               ra_alloc_xmm(ir1_opnd_base_reg_num(src)), 1);
-            li_host_addr(tmp, smc_store_helper_vst);
+            aot_load_host_addr(tmp, (ADDR)smc_store_helper_vst,
+                    LOAD_HELPER_SMC_VST, 0);
             la_jirl(ra_ir2_opnd, tmp, 0);
             // restore context
             tr_load_registers_from_env(0xff, 0x0, 0x0, 0);

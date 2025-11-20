@@ -21,6 +21,7 @@
 #include "aot_page.h"
 #include<sys/syscall.h>
 #include "exec/translate-all.h"
+#include "latx-smc.h"
 #ifdef CONFIG_LATX_AOT
 /* Tbs vector with @tb_num@ elements. */
 static TranslationBlock **tb_vector;
@@ -1177,6 +1178,10 @@ static void* relkind_to_fixup_addr[] = {
 #ifdef TARGET_X86_64
     [LOAD_HELPER_RAISE_SYSCALL] = helper_raise_syscall,
 #endif
+
+    [LOAD_HELPER_SMC_ST] = smc_store_helper_st,
+    [LOAD_HELPER_SMC_VST] = smc_store_helper_vst,
+    [LOAD_HELPER_SMC_VST_X4] = smc_store_helper_vst_x4,
 
     [LOAD_HOST_POW] = pow,
     [LOAD_HOST_SIN] = sin,
