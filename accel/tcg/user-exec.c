@@ -29,6 +29,7 @@
 #include "trace/trace-root.h"
 #include "trace/mem.h"
 #include <dlfcn.h>
+#include "loongarch-extcontext.h"
 
 #ifdef CONFIG_LATX
 #include "qemu.h"
@@ -260,6 +261,13 @@ static int smc_store_interpret(siginfo_t *info, ucontext_t *uc)
     uint32_t inst, rd, rj, fd;
     int64_t value, mem_addr;
 
+#ifdef CONFIG_LOONGARCH_NEW_WORLD
+    struct extctx_layout extctx;
+    memset(&extctx, 0, sizeof(extctx));
+    /* we need to parse the extcontext data */
+    parse_extcontext(uc, &extctx);
+#endif
+
     inst = *(uint32_t *)UC_PC(uc);
     rd = inst & 0x1f;
     rj = (inst >> 5) & 0x1f;
@@ -285,6 +293,7 @@ static int smc_store_interpret(siginfo_t *info, ucontext_t *uc)
         value = UC_GR(uc)[rd];
         smc_store_shadow_page(mem_addr, value, 8);
         break;
+#ifndef CONFIG_LOONGARCH_NEW_WORLD
     case 0xb1: /* VST */
         fd = rd + 1;
         value = UC_FREG(uc)[fd].__val64[0];
@@ -292,6 +301,15 @@ static int smc_store_interpret(siginfo_t *info, ucontext_t *uc)
         value = UC_FREG(uc)[fd].__val64[1];
         smc_store_shadow_page(mem_addr + 8, value, 8);
         break;
+#else
+    case 0xb1: /* VST */
+        fd = rd;
+        value = UC_GET_LSX(&extctx, fd, 0, uint64_t);
+        smc_store_shadow_page(mem_addr, value, 8);
+        value = UC_GET_LSX(&extctx, fd, 1, uint64_t);
+        smc_store_shadow_page(mem_addr + 8, value, 8);
+        break;
+#endif
     default:
         fprintf(stderr, "%s:%d SMC unsupport inst %08x\n",
                 __func__, __LINE__, inst);
