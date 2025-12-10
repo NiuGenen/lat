@@ -70,6 +70,7 @@ i386_ss.add(when: 'CONFIG_LATX', if_true: files(
   'latx-name-demangling.cpp',
   'latx-special-args.c',
   'latx-signal.c',
+  'latx-per-proc.c',
 ))
 
 laxed_lib = static_library('laxed',

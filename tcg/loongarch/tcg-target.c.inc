@@ -1775,6 +1775,7 @@ QEMU_BUILD_BUG_ON(FRAME_SIZE > 0x7ff);
 #ifdef CONFIG_LATX
 #include "latx-config.h"
 #include "latx-options.h"
+#include "latx-per-proc.h"
 
 /* Generate global QEMU prologue and epilogue code */
 static void tcg_target_qemu_prologue(TCGContext *s)
@@ -1785,6 +1786,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
     latx_interpret_glue_init();
 // --------------------------------- prologue ------------------------------- //
     inst_nr = target_latx_prologue(s->code_ptr);
+    latx_perfmap_insert(s->code_ptr, inst_nr << 2, "code_cache_prologue");
     if (option_dump)
         qemu_log("[prologue] bt to native : %p, size = %d\n", s->code_ptr, inst_nr * 4);
     s->code_ptr += inst_nr;
@@ -1792,6 +1794,7 @@ static void tcg_target_qemu_prologue(TCGContext *s)
 
 // --------------------------------- epilogue ------------------------------- //
     inst_nr = target_latx_epilogue(s->code_ptr);
+    latx_perfmap_insert(s->code_ptr, inst_nr << 2, "code_cache_epilogue");
     if (option_dump)
         qemu_log("[epilogue] native to bt %p, size = %d\n", s->code_ptr, inst_nr * 4);
     tcg_code_gen_epilogue = s->code_ptr;

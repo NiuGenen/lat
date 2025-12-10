@@ -1397,6 +1397,7 @@ void tcg_prologue_init(TCGContext *s)
     s->code_gen_buffer_size = total_size;
 
     tcg_register_jit(tcg_splitwx_to_rx(s->code_gen_buffer), total_size);
+    latx_perfmap_insert(s->code_gen_buffer, total_size, "code_cache_block");
 
     if (option_split_tb) {
         s->tb_gen_ptr = s->tb_gen_buffer;

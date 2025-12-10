@@ -14,6 +14,7 @@
 #include "latx-smc.h"
 #include "jrra.h"
 #include "latx-native-asm.h"
+#include "latx-per-proc.h"
 
 extern void *helper_tb_lookup_ptr(CPUArchState *);
 static int ss_generate_match_fail_native_code(void* code_buf);
@@ -3118,6 +3119,7 @@ int generate_native_rotate_fpu_by(void *code_buf_addr)
      */
     indirect_jmp_glue = (ADDR)code_buf;
     insts_num = generate_indirect_jmp_glue(code_buf);
+    latx_perfmap_insert(code_buf, insts_num << 2, "code_cache_intb_jmp_glue");
     if (option_dump)
         qemu_log("[glue] indirect jump dispatch at %p. size = %d\n",
                 code_buf, insts_num);
