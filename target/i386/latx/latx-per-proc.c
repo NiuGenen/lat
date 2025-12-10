@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sys/syscall.h>
 #include "./include/latx-per-proc.h"
 
 #ifdef LATX_PERFMAP_ENABLE
@@ -54,18 +55,54 @@ void latx_perfmap_flush(void)
 }
 #endif
 
+
+#ifdef LATX_PRINT_PER_THREAD_ENABLE
+__thread FILE *latx_print_per_thread_file;
+static inline void print_perthread_file_create(void)
+{
+    char file[64];
+    sprintf(file, "/tmp/latx-perthread-%d-%d.data",
+            getpid(), (int)syscall(SYS_gettid));
+    latx_print_per_thread_file = fopen(file, "w");
+}
+static void print_perthread_main_init(void)
+{
+    print_perthread_file_create();
+}
+static void print_perthread_child_init(void)
+{
+    print_perthread_file_create();
+}
+void latx_print_perthread_init(void)
+{
+    if (latx_print_per_thread_file) return;
+    print_perthread_file_create();
+}
+#endif
+
 static void child_per_proc_init(void)
 {
 #ifdef LATX_PERFMAP_ENABLE
     perfmap_child_init();
+#endif
+#ifdef LATX_PRINT_PER_THREAD_ENABLE
+    print_perthread_child_init();
 #endif
 }
 
 static
 void __attribute__((__constructor__)) latx_per_proc_init(void)
 {
+    int need_child = 0;
 #ifdef LATX_PERFMAP_ENABLE
     perfmap_main_init();
+    need_child = 1;
 #endif
-    pthread_atfork(NULL, NULL, child_per_proc_init);
+#ifdef LATX_PRINT_PER_THREAD_ENABLE
+    print_perthread_main_init();
+    need_child = 1;
+#endif
+    if (need_child) {
+        pthread_atfork(NULL, NULL, child_per_proc_init);
+    }
 }
